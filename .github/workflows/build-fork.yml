@@ -18,58 +18,11 @@ env:
 # The upstream Dockerfile uses shared apt caches (`--mount=type=cache,sharing=shared`),
 # which can deadlock when two architectures compete for the same host-side mount via
 # QEMU emulation. Build per platform in a matrix so each architecture gets its own
-# isolated cache scope and Buildx instance, mirroring the official `docker-publish.yml`
-# job layout. A per-platform `runner-base` image is pushed by digest and the merge
-# job promotes the tags after every architecture succeeds.
+# isolated cache scope and Buildx instance. The merge job stitches the per-platform
+# images into a single multi-arch manifest.
 jobs:
-  prepare:
-    name: Resolve Docker release metadata
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      promote_latest: ${{ steps.version.outputs.promote_latest }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Resolve version and latest promotion
-        id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
-        run: |
-          set -euo pipefail
-          case "$EVENT_NAME" in
-            push)
-              if [ "$REF_TYPE" = "tag" ]; then
-                VERSION="${REF_NAME#v}"
-              else
-                VERSION="main"
-              fi
-              ;;
-            *)
-              VERSION="${REF_NAME#v}"
-              ;;
-          esac
-          if ! printf '%s' "$VERSION" | grep -qE '^[A-Za-z0-9._-]+$'; then
-            echo "Refusing to use unsafe VERSION value: $VERSION" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if [ "$VERSION" = "main" ]; then
-            PROMOTE="true"
-          else
-            PROMOTE="false"
-          fi
-          echo "promote_latest=$PROMOTE" >> "$GITHUB_OUTPUT"
-          echo "Publishing $IMAGE_NAME:$VERSION (promote_latest=$PROMOTE)"
-
   build:
     name: Build platform image (${{ matrix.platform }})
-    needs: prepare
     if: github.repository == 'daviirodrig/OmniRoute'
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -131,20 +84,17 @@ jobs:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
-  merge:
-    name: Merge manifests and tag release
-    needs: [prepare, build]
+          retention-days: 1
+
+  manifest:
+    name: Create multi-arch manifest
+    needs: build
     if: github.repository == 'daviirodrig/OmniRoute'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -170,33 +120,53 @@ jobs:
             echo "digest: $(basename "$f")"
           done
 
-      - name: Build merged manifest and tag release
+      - name: Compute tag list
+        id: tags
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          PROMOTE: ${{ needs.prepare.outputs.promote_latest }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            VERSION="${REF_NAME#v}"
+            TAGS="$VERSION sha-$VERSION"
+            PROMOTE="false"
+          else
+            VERSION="main"
+            TAGS="main latest"
+            PROMOTE="true"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "promote=$PROMOTE" >> "$GITHUB_OUTPUT"
+          echo "Publishing $IMAGE_NAME with tags: $TAGS"
+
+      - name: Create multi-arch manifest and tag release
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
           set -euo pipefail
           if [ ! -d /tmp/digests ] || [ -z "$(ls -A /tmp/digests 2>/dev/null || true)" ]; then
-            echo "No digests found, cannot merge manifest" >&2
+            echo "No digests found, cannot build manifest" >&2
             exit 1
           fi
 
-          TAGS=("$VERSION")
-          if [ "$PROMOTE" = "true" ]; then
-            TAGS+=("latest")
-          fi
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            TAGS+=("sha-${VERSION}")
-          fi
+          FIRST_DIGEST="$(ls /tmp/digests | head -n1)"
+          SOURCE="${{ env.IMAGE_NAME }}@sha256:${FIRST_DIGEST}"
 
-          PLATFORM_ARGS=()
-          for digest in /tmp/digests/*; do
-            PLATFORM_ARGS+=("--amend" "${{ env.IMAGE_NAME }}@sha256:$(basename "$digest")")
+          FIRST_TAG="$(echo "$TAGS" | awk '{print $1}')"
+          docker buildx imagetools create --tag "${{ env.IMAGE_NAME }}:$FIRST_TAG" "$SOURCE"
+
+          for extra_digest in $(ls /tmp/digests | tail -n +2); do
+            docker buildx imagetools create \
+              --tag "${{ env.IMAGE_NAME }}:$FIRST_TAG" \
+              "${{ env.IMAGE_NAME }}@sha256:${extra_digest}"
           done
 
-          for tag in "${TAGS[@]}"; do
-            echo "Tagging manifest ${{ env.IMAGE_NAME }}:$tag"
+          for tag in $TAGS; do
+            [ "$tag" = "$FIRST_TAG" ] && continue
             docker buildx imagetools create \
-              "${PLATFORM_ARGS[@]}" \
-              --tag "${{ env.IMAGE_NAME }}:$tag"
+              --tag "${{ env.IMAGE_NAME }}:$tag" \
+              "${{ env.IMAGE_NAME }}:$FIRST_TAG"
           done
