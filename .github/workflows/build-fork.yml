@@ -152,21 +152,28 @@ jobs:
             exit 1
           fi
 
-          FIRST_DIGEST="$(ls /tmp/digests | head -n1)"
-          SOURCE="${{ env.IMAGE_NAME }}@sha256:${FIRST_DIGEST}"
+          mapfile -t DIGESTS < <(ls /tmp/digests)
+          echo "Collected digests:"
+          printf '  - %s\n' "${DIGESTS[@]}"
 
-          FIRST_TAG="$(echo "$TAGS" | awk '{print $1}')"
-          docker buildx imagetools create --tag "${{ env.IMAGE_NAME }}:$FIRST_TAG" "$SOURCE"
-
-          for extra_digest in $(ls /tmp/digests | tail -n +2); do
-            docker buildx imagetools create \
-              --tag "${{ env.IMAGE_NAME }}:$FIRST_TAG" \
-              "${{ env.IMAGE_NAME }}@sha256:${extra_digest}"
+          # Build a multi-arch manifest list from every per-platform digest in a
+          # single `imagetools create` invocation. Subsequent `imagetools create`
+          # calls would replace the manifest instead of appending, so we always
+          # pass every digest here. Any extra tags point at the same manifest
+          # by reference, which is cheap and keeps every tag in sync.
+          PRIMARY_TAG="$(echo "$TAGS" | awk '{print $1}')"
+          PRIMARY_SRC=""
+          for digest in "${DIGESTS[@]}"; do
+            PRIMARY_SRC="$PRIMARY_SRC ${{ env.IMAGE_NAME }}@sha256:${digest}"
           done
 
+          docker buildx imagetools create \
+            --tag "${{ env.IMAGE_NAME }}:$PRIMARY_TAG" \
+            $PRIMARY_SRC
+
           for tag in $TAGS; do
-            [ "$tag" = "$FIRST_TAG" ] && continue
+            [ "$tag" = "$PRIMARY_TAG" ] && continue
             docker buildx imagetools create \
               --tag "${{ env.IMAGE_NAME }}:$tag" \
-              "${{ env.IMAGE_NAME }}:$FIRST_TAG"
+              "${{ env.IMAGE_NAME }}:$PRIMARY_TAG"
           done
