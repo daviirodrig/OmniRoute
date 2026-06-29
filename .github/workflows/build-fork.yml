@@ -15,22 +15,82 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/daviirodrig/omniroute
 
+# The upstream Dockerfile uses shared apt caches (`--mount=type=cache,sharing=shared`),
+# which can deadlock when two architectures compete for the same host-side mount via
+# QEMU emulation. Build per platform in a matrix so each architecture gets its own
+# isolated cache scope and Buildx instance, mirroring the official `docker-publish.yml`
+# job layout. A per-platform `runner-base` image is pushed by digest and the merge
+# job promotes the tags after every architecture succeeds.
 jobs:
-  build:
-    name: Build and Push Fork Image
-    if: github.repository == 'daviirodrig/OmniRoute'
+  prepare:
+    name: Resolve Docker release metadata
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      promote_latest: ${{ steps.version.outputs.promote_latest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Resolve version and latest promotion
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            push)
+              if [ "$REF_TYPE" = "tag" ]; then
+                VERSION="${REF_NAME#v}"
+              else
+                VERSION="main"
+              fi
+              ;;
+            *)
+              VERSION="${REF_NAME#v}"
+              ;;
+          esac
+          if ! printf '%s' "$VERSION" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "Refusing to use unsafe VERSION value: $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$VERSION" = "main" ]; then
+            PROMOTE="true"
+          else
+            PROMOTE="false"
+          fi
+          echo "promote_latest=$PROMOTE" >> "$GITHUB_OUTPUT"
+          echo "Publishing $IMAGE_NAME:$VERSION (promote_latest=$PROMOTE)"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+  build:
+    name: Build platform image (${{ matrix.platform }})
+    needs: prepare
+    if: github.repository == 'daviirodrig/OmniRoute'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -42,30 +102,101 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-            type=ref,event=tag
-          labels: |
-            org.opencontainers.image.title=omniroute
-            org.opencontainers.image.description=Unified AI proxy/router — fork image
-            org.opencontainers.image.url=https://github.com/daviirodrig/OmniRoute
-            org.opencontainers.image.source=https://github.com/daviirodrig/OmniRoute
-            org.opencontainers.image.licenses=MIT
-
-      - name: Build and push
+      - name: Build and push platform image by digest
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           target: runner-base
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          tags: ${{ env.IMAGE_NAME }}
+          cache-from: type=gha,scope=docker-fork-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-fork-${{ matrix.arch }},mode=max
+          no-cache: false
+        env:
+          DOCKER_BUILDKIT_INLINE_CACHE: 1
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+  merge:
+    name: Merge manifests and tag release
+    needs: [prepare, build]
+    if: github.repository == 'daviirodrig/OmniRoute'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Inspect downloaded digests
+        run: |
+          set -euo pipefail
+          ls -la /tmp/digests
+          for f in /tmp/digests/*; do
+            echo "digest: $(basename "$f")"
+          done
+
+      - name: Build merged manifest and tag release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PROMOTE: ${{ needs.prepare.outputs.promote_latest }}
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/digests ] || [ -z "$(ls -A /tmp/digests 2>/dev/null || true)" ]; then
+            echo "No digests found, cannot merge manifest" >&2
+            exit 1
+          fi
+
+          TAGS=("$VERSION")
+          if [ "$PROMOTE" = "true" ]; then
+            TAGS+=("latest")
+          fi
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            TAGS+=("sha-${VERSION}")
+          fi
+
+          PLATFORM_ARGS=()
+          for digest in /tmp/digests/*; do
+            PLATFORM_ARGS+=("--amend" "${{ env.IMAGE_NAME }}@sha256:$(basename "$digest")")
+          done
+
+          for tag in "${TAGS[@]}"; do
+            echo "Tagging manifest ${{ env.IMAGE_NAME }}:$tag"
+            docker buildx imagetools create \
+              "${PLATFORM_ARGS[@]}" \
+              --tag "${{ env.IMAGE_NAME }}:$tag"
+          done
