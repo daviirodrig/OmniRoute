@@ -733,6 +733,18 @@ export async function handleComboChat({
     reasoningTokenBufferEnabled,
   } = phaseComboSetup(comboCtx);
   body = comboCtx.body;
+  // ── Simple Mode ────────────────────────────────────────────────────────────
+  // When a combo is flagged with `config.simpleMode === true` the operator
+  // wants a fail-fast cascading fallback: any error from a provider instantly
+  // jumps to the next model in the user's order, with no waits, no retries
+  // on the same model, no hedging, and no body-specific 400 short-circuit.
+  // The combo's own retry/fallback/hedging config is overridden below so the
+  // only knob that matters in simple mode is the model list itself.
+  const isSimpleMode = (() => {
+    if (!config || typeof config !== "object") return false;
+    if (!("simpleMode" in config)) return false;
+    return config.simpleMode === true;
+  })();
 
   const handleSingleModelWithTimeout = async (
     b: Record<string, unknown>,
@@ -1013,11 +1025,14 @@ export async function handleComboChat({
     });
   }
 
-  const maxRetries = config.maxRetries ?? 1;
-  const retryDelayMs = resolveDelayMs(config.retryDelayMs, 2000);
-  const fallbackDelayMs = resolveDelayMs(config.fallbackDelayMs, 0);
-  const maxSetRetries = config.maxSetRetries ?? 0;
-  const setRetryDelayMs = resolveDelayMs(config.setRetryDelayMs, 2000);
+  // Simple mode overrides any combo-level config: no per-model retries, no
+  // set retries, and no waits between fallbacks. The model's own behavior
+  // is the only thing that matters.
+  const maxRetries = isSimpleMode ? 0 : (config.maxRetries ?? 1);
+  const retryDelayMs = isSimpleMode ? 0 : resolveDelayMs(config.retryDelayMs, 2000);
+  const fallbackDelayMs = isSimpleMode ? 0 : resolveDelayMs(config.fallbackDelayMs, 0);
+  const maxSetRetries = isSimpleMode ? 0 : (config.maxSetRetries ?? 0);
+  const setRetryDelayMs = isSimpleMode ? 0 : resolveDelayMs(config.setRetryDelayMs, 2000);
 
   const isTargetSelectableForWeighted = async (target: ResolvedComboTarget): Promise<boolean> => {
     const rawModel = parseModel(target.modelStr).model || target.modelStr;
@@ -1730,13 +1745,17 @@ export async function handleComboChat({
         const provider = target.provider;
 
         const cb = getCircuitBreaker(provider);
-        if (cb.getStatus().state === "OPEN") {
+        // Simple mode: bypass circuit-breaker skip — try the model anyway, let
+        // the actual call surface the error so the next model is attempted.
+        if (!isSimpleMode && cb.getStatus().state === "OPEN") {
           log.info("COMBO", `Skipping ${modelStr} — circuit breaker OPEN for ${provider}`);
           if (i > 0) fallbackCount++;
           return null;
         }
-
+        // Simple mode: bypass provider-cooldown skip — let the call fail fast and
+        // fall through to the next model instead of pre-skipping.
         if (
+          !isSimpleMode &&
           resilienceSettings.providerCooldown.enabled &&
           Boolean(provider && provider !== "unknown") &&
           isProviderInCooldown(provider, target.connectionId ?? undefined, resilienceSettings)
@@ -1767,14 +1786,23 @@ export async function handleComboChat({
           exhaustedProviders,
           exhaustedConnections
         );
-        if (exhaustedSkip) {
+        // Simple mode: skip the known-exhausted check — the user wants to try
+        // every model in the list and let the call fail rather than pre-filter.
+        if (!isSimpleMode && exhaustedSkip) {
           log.info("COMBO", exhaustedSkip);
           if (i > 0) fallbackCount++;
           return null;
         }
 
         // Pre-check: skip models locked by the resilience system (model-level lockout)
-        if (provider && rawModel && isModelLocked(provider, target.connectionId || "", rawModel)) {
+        // Simple mode: bypass model-lockout skip — let the call attempt and
+        // fall through on error instead of being gated by a prior lockout.
+        if (
+          !isSimpleMode &&
+          provider &&
+          rawModel &&
+          isModelLocked(provider, target.connectionId || "", rawModel)
+        ) {
           log.info("COMBO", `Skipping ${modelStr} — model locked by resilience (cooldown active)`);
           if (i > 0) fallbackCount++;
           return null;
@@ -1784,8 +1812,9 @@ export async function handleComboChat({
         // is always re-checked via isModelAvailable below because connection
         // cooldowns can expire between setTry retries, making a previously
         // unavailable target available again.  Circuit-breaker-OPEN providers
-        // are already caught by the dedicated breaker check above.
-        if (isModelAvailable) {
+        // Simple mode: skip the availability pre-check — the user wants to try
+        // every model and let the upstream call be the single source of truth.
+        if (!isSimpleMode && isModelAvailable) {
           const available = await isModelAvailable(modelStr, targetForAttempt);
           if (!available) {
             log.debug?.(
@@ -1799,7 +1828,9 @@ export async function handleComboChat({
 
         // Credential gate: skip targets with known-bad credentials (fail-fast)
         const connectionId = target.connectionId as string | undefined;
-        if (connectionId) {
+        // Simple mode: skip the credential-gate check — let the upstream call
+        // fail fast on bad creds and fall through to the next model.
+        if (!isSimpleMode && connectionId) {
           const gateResult = checkCredentialGate(connectionId, provider, modelStr);
           if (gateResult.allowed === false) {
             logCredentialSkip(log, modelStr, gateResult.reason || "Credential gate blocked");
@@ -1825,7 +1856,10 @@ export async function handleComboChat({
           }
 
           // Predictive TTFT Circuit Breaker (skip slow models)
+          // Simple mode: never pre-skip on predicted latency — let the call run
+          // and fall through on actual error.
           if (
+            !isSimpleMode &&
             zeroLatencyOptimizationsEnabled &&
             config.predictiveTtftMs &&
             config.predictiveTtftMs > 0 &&
@@ -2339,7 +2373,12 @@ export async function handleComboChat({
           // - Max_tokens / param errors: different models have different output limits
           // - Model access denied: different providers serve different model sets
           // These should fall through so the next combo target can try.
+          //
+          // Simple mode OVERRIDES this guard: the user explicitly wants every
+          // error to fall through to the next model, including body-rejecting
+          // 400s, so the chain only fails on the last model's failure.
           if (
+            !isSimpleMode &&
             result.status === 400 &&
             fallbackResult.shouldFallback &&
             !isContextOverflow400(errorText) &&
@@ -2484,7 +2523,11 @@ export async function handleComboChat({
             fallbackDelayMs > 0 && cooldownMs > 0 && cooldownMs <= MAX_FALLBACK_WAIT_MS
               ? Math.min(cooldownMs, fallbackDelayMs)
               : 0;
-          if ([502, 503, 504].includes(result.status) && fallbackWaitMs > 0) {
+          // Simple mode: never wait between fallbacks — the user wants the next
+          // model tried instantly. This preserves `fallbackDelayMs = 0` semantics
+          // (it is also forced to 0 above) and removes the only path that could
+          // introduce a real wait here.
+          if (!isSimpleMode && [502, 503, 504].includes(result.status) && fallbackWaitMs > 0) {
             log.debug?.("COMBO", `Waiting ${fallbackWaitMs}ms before fallback to next model`);
             await new Promise((resolve) => {
               const timer = setTimeout(resolve, fallbackWaitMs);
@@ -2503,6 +2546,14 @@ export async function handleComboChat({
             }
           }
 
+          // Simple mode: this is the contract. On any non-ok result, fall through
+          // to the next model by returning null. UNLESS we are on the LAST model,
+          // in which case we must surface the final error so the outer loop
+          // resolves the response and the chain fails (per "failing only if the
+          // last model fails").
+          if (isSimpleMode && i === orderedTargets.length - 1) {
+            return { ok: false, response: result };
+          }
           return null;
         }
         return null;
@@ -2543,7 +2594,12 @@ export async function handleComboChat({
         runningTasks.add(task);
         task.finally(() => runningTasks.delete(task));
 
-        if (zeroLatencyOptimizationsEnabled && config.hedging && i + 1 < orderedTargets.length) {
+        if (
+          !isSimpleMode &&
+          zeroLatencyOptimizationsEnabled &&
+          config.hedging &&
+          i + 1 < orderedTargets.length
+        ) {
           const hedgeDelay = resolveDelayMs(config.hedgeDelayMs, 500);
           let timeoutResolve: () => void;
           const timeoutPromise = new Promise<void>((r) => {
